@@ -14,7 +14,7 @@ mod error;
 
 use error::JibError;
 
-const MAX_TX_LEN: usize = 1100;
+const MAX_TX_LEN: usize = 1232;
 
 pub struct Jib {
     tpu_client: TpuClient,
@@ -74,12 +74,6 @@ impl Jib {
 
         let mut packed_transactions = Vec::new();
 
-        let latest_blockhash = self
-            .tpu_client
-            .rpc_client()
-            .get_latest_blockhash()
-            .map_err(|_| JibError::NoRecentBlockhash)?;
-
         let mut instructions = Vec::new();
         let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
 
@@ -87,21 +81,25 @@ impl Jib {
             Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
         let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
 
+        let latest_blockhash = self
+            .tpu_client
+            .rpc_client()
+            .get_latest_blockhash()
+            .map_err(|_| JibError::NoRecentBlockhash)?;
+
         for ix in self.ixes.iter_mut() {
             instructions.push(ix.clone());
             let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
             tx.sign(&signers, latest_blockhash);
 
-            let tx_len = tx.message().serialize().len();
+            let tx_len = bincode::serialize(&tx).unwrap().len();
 
             println!("tx_len: {}", tx_len);
 
             if tx_len > MAX_TX_LEN {
                 packed_transactions.push(current_transaction.clone());
-                println!(
-                    "packed {} instructions into transaction",
-                    instructions.len()
-                );
+                println!("Packed instructions: {}", instructions.len());
+
                 // clear instructions except for last one
                 instructions = vec![ix.clone()];
             } else {
@@ -117,10 +115,6 @@ impl Jib {
             .iter()
             .map(|tx| tx.message.clone())
             .collect::<Vec<_>>();
-
-        // self.tpu_client
-        //     .try_send_transaction_batch(packed_transactions.as_slice())
-        //     .map_err(|e| JibError::BatchTransactionError(e.to_string()))?;
 
         self.tpu_client
             .send_and_confirm_messages_with_spinner(messages.as_slice(), &signers)
