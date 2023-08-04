@@ -4,7 +4,6 @@ use solana_client::{
     rpc_client::RpcClient,
     tpu_client::{TpuClient, TpuClientConfig},
 };
-// use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use solana_sdk::{
     commitment_config::CommitmentConfig, instruction::Instruction, signature::Keypair,
     signer::Signer, transaction::Transaction,
@@ -96,7 +95,7 @@ impl Jib {
 
             println!("tx_len: {}", tx_len);
 
-            if tx_len > MAX_TX_LEN {
+            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
                 packed_transactions.push(current_transaction.clone());
                 println!("Packed instructions: {}", instructions.len());
 
