@@ -62,7 +62,7 @@ impl Jib {
         self.signers.first().unwrap()
     }
 
-    pub fn hoist(mut self) -> Result<(), JibError> {
+    pub fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
         println!(
             "Commitment level: {:?}",
             self.tpu_client.rpc_client().commitment()
@@ -108,6 +108,14 @@ impl Jib {
         packed_transactions.push(current_transaction);
 
         println!("Packed transactions: {}", packed_transactions.len());
+
+        Ok(packed_transactions)
+    }
+
+    pub fn hoist(mut self) -> Result<(), JibError> {
+        let packed_transactions = self.pack()?;
+
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
 
         let messages = packed_transactions
             .as_slice()
