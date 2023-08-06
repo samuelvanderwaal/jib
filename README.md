@@ -3,8 +3,8 @@
 Jib is a simple Rust library that efficiently packs a vector of Solana instructions into maximum size and account length transactions
 and then uses the TPU client to send them directly to the current leader, rather than via a RPC node.
 
-It still uses a RPC client to determine the current leader, but it defaults to using the public RPC nodes since this single operation 
-isn't a high intensity operation.
+It still uses a RPC client to determine the current leader, but it can be used with default public nodes as the single operation required
+does not need a high-throughput private RPC node.
 
 ## Example Usage
 
