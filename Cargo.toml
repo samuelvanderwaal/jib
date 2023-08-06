@@ -4,14 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Jib is a library for the Solana blockchain that lets you efficiently pack instructions into transactions and submit them via a TPU client."
-license-file = "LICENSE"
 repository = "https://github.com/samuelvanderwaal/jib"
 readme = "README.md"
 keywords = ["solana", "blockchain", "transactions", "instructions", "tpu"]
 documentation = "https://docs.rs/jib"
 homepage = "https://github.com/samuelvanderwaal/jib"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 bincode = "1.3.3"
