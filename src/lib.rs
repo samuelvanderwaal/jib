@@ -8,6 +8,7 @@ use solana_sdk::{
     commitment_config::CommitmentConfig, instruction::Instruction, signature::Keypair,
     signer::Signer, transaction::Transaction,
 };
+use tracing::debug;
 
 mod error;
 
@@ -63,7 +64,7 @@ impl Jib {
     }
 
     pub fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
-        println!(
+        debug!(
             "Commitment level: {:?}",
             self.tpu_client.rpc_client().commitment()
         );
@@ -93,11 +94,11 @@ impl Jib {
 
             let tx_len = bincode::serialize(&tx).unwrap().len();
 
-            println!("tx_len: {}", tx_len);
+            debug!("tx_len: {}", tx_len);
 
             if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
                 packed_transactions.push(current_transaction.clone());
-                println!("Packed instructions: {}", instructions.len());
+                debug!("Packed instructions: {}", instructions.len());
 
                 // clear instructions except for last one
                 instructions = vec![ix.clone()];
@@ -107,7 +108,7 @@ impl Jib {
         }
         packed_transactions.push(current_transaction);
 
-        println!("Packed transactions: {}", packed_transactions.len());
+        debug!("Packed transactions: {}", packed_transactions.len());
 
         Ok(packed_transactions)
     }
