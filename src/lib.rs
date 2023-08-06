@@ -1,3 +1,11 @@
+//! # Jib
+//!
+//! Jib is a simple Rust library that efficiently packs a vector of Solana instructions into maximum size and account length transactions
+//! and then uses the TPU client to send them directly to the current leader, rather than via a RPC node.
+//!
+//! It still uses a RPC client to determine the current leader, but it defaults to using the public RPC nodes since this single operation
+//! isn't a high intensity operation.
+
 use std::sync::Arc;
 
 use solana_client::{
@@ -60,7 +68,6 @@ const MAX_TX_LEN: usize = 1232;
 ///     Ok(())
 /// }
 /// ```
-
 pub struct Jib {
     tpu_client: TpuClient,
     signers: Vec<Keypair>,
