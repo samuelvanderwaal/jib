@@ -19,7 +19,7 @@ const MAX_TX_LEN: usize = 1232;
 /// The Jib struct is the main entry point for the library.
 /// It is used to create a new Jib instance, set the RPC URL, set the instructions, pack the instructions into transactions
 /// and finally hoist the transactions to the network.
-/// ```rust
+/// ```ignore
 /// fn main() -> Result<()> {
 ///     // Load our keypair file.
 ///     let keypair = solana_sdk::signature::read_keypair_file("keypair.json").unwrap();
