@@ -11,13 +11,13 @@
 //! In this example we load a list of mint accounts we want to update the metadata for, and then we create a vector of instructions with the update_metadata_accounts_v2 instruction for each mint.
 //! We then pass this vector of instructions to Jib and it will pack them into the most efficient transactions possible and send them to the current leader.
 //!
-//! ```rust
+//! ```ignore
 //! fn main() -> Result<()> {
 //!     // Load our keypair file.
 //!     let keypair = solana_sdk::signature::read_keypair_file("keypair.json").unwrap();
 //!
-//!     // Initialize Jib with our keypair.
-//!     let mut jib = Jib::new(vec![keypair])?;
+//!     // Initialize Jib with our keypair and desired network. Devnet is also the default value: Network::default().
+//!     let mut jib = Jib::new(vec![keypair], Network::Devnet)?;
 //!
 //!     let mut instructions = vec![];
 //!
@@ -71,7 +71,11 @@ use error::JibError;
 
 const MAX_TX_LEN: usize = 1232;
 
+/// The Network enum is used to set the RPC URL to use for the transactions.
+/// The default value is Devnet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Network {
+    #[default]
     Devnet,
     MainnetBeta,
     Testnet,
@@ -98,8 +102,8 @@ pub struct Jib {
 
 impl Jib {
     /// Create a new Jib instance. You should pass in all the signers you want to use for the transactions.
-    pub fn new(signers: Vec<Keypair>) -> Result<Self, JibError> {
-        let tpu_client = Self::create_tpu_client("https://api.devnet.solana.com")?;
+    pub fn new(signers: Vec<Keypair>, network: Network) -> Result<Self, JibError> {
+        let tpu_client = Self::create_tpu_client(network.url())?;
 
         Ok(Self {
             tpu_client,

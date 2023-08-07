@@ -16,8 +16,8 @@ fn main() -> Result<()> {
     // Load our keypair file.
     let keypair = solana_sdk::signature::read_keypair_file("keypair.json").unwrap();
 
-    // Initialize Jib with our keypair.
-    let mut jib = Jib::new(vec![keypair])?;
+    // Initialize Jib with our keypair and desired network. Devnet is also the default value: Network::default().
+    let mut jib = Jib::new(vec![keypair], Network::Devnet)?;
 
     let mut instructions = vec![];
 
