@@ -11,7 +11,7 @@
 //! In this example we load a list of mint accounts we want to update the metadata for, and then we create a vector of instructions with the update_metadata_accounts_v2 instruction for each mint.
 //! We then pass this vector of instructions to Jib and it will pack them into the most efficient transactions possible and send them to the current leader.
 //!
-//! ```rust
+//! ```ignore
 //! fn main() -> Result<()> {
 //!     // Load our keypair file.
 //!     let keypair = solana_sdk::signature::read_keypair_file("keypair.json").unwrap();
