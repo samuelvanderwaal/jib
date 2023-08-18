@@ -53,7 +53,7 @@
 //! }
 //! ```
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use solana_client::{
     rpc_client::RpcClient,
@@ -79,6 +79,21 @@ pub enum Network {
     Devnet,
     MainnetBeta,
     Testnet,
+    Localnet,
+}
+
+impl FromStr for Network {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "devnet" => Ok(Network::Devnet),
+            "mainnet" => Ok(Network::MainnetBeta),
+            "testnet" => Ok(Network::Testnet),
+            "localnet" => Ok(Network::Localnet),
+            _ => Err(()),
+        }
+    }
 }
 
 impl Network {
@@ -87,6 +102,7 @@ impl Network {
             Network::Devnet => "https://api.devnet.solana.com",
             Network::MainnetBeta => "https://api.mainnet-beta.solana.com",
             Network::Testnet => "https://api.testnet.solana.com",
+            Network::Localnet => "http://127.0.0.1:8899",
         }
     }
 }
