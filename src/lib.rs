@@ -96,6 +96,17 @@ impl FromStr for Network {
     }
 }
 
+impl ToString for Network {
+    fn to_string(&self) -> String {
+        match self {
+            Network::Devnet => "devnet".to_string(),
+            Network::MainnetBeta => "mainnet".to_string(),
+            Network::Testnet => "testnet".to_string(),
+            Network::Localnet => "localnet".to_string(),
+        }
+    }
+}
+
 impl Network {
     pub fn url(&self) -> &'static str {
         match self {
