@@ -53,15 +53,29 @@
 //! }
 //! ```
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::Arc,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
+use serde::{Deserialize, Serialize};
 use solana_client::{
+    nonblocking::tpu_client::TpuSenderError,
     rpc_client::RpcClient,
+    rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
     tpu_client::{TpuClient, TpuClientConfig},
 };
 use solana_sdk::{
-    commitment_config::CommitmentConfig, instruction::Instruction, signature::Keypair,
-    signer::Signer, transaction::Transaction,
+    commitment_config::CommitmentConfig,
+    instruction::Instruction,
+    message::Message,
+    signature::{Keypair, Signature},
+    signer::Signer,
+    signers::Signers,
+    transaction::Transaction,
 };
 use tracing::debug;
 
@@ -70,6 +84,11 @@ mod error;
 use error::JibError;
 
 const MAX_TX_LEN: usize = 1232;
+
+/// Send at ~100 TPS
+const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(10);
+/// Retry batch send after 4 seconds
+const TRANSACTION_RESEND_INTERVAL: Duration = Duration::from_secs(4);
 
 /// The Network enum is used to set the RPC URL to use for the transactions.
 /// The default value is Devnet.
@@ -125,6 +144,31 @@ pub struct Jib {
     tpu_client: TpuClient,
     signers: Vec<Keypair>,
     ixes: Vec<Instruction>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JibResult {
+    Success(String),
+    Failure(JibFailedTransaction),
+}
+
+impl JibResult {
+    pub fn is_success(&self) -> bool {
+        match self {
+            JibResult::Success(_) => true,
+            JibResult::Failure(_) => false,
+        }
+    }
+
+    pub fn is_failure(&self) -> bool {
+        !self.is_success()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JibFailedTransaction {
+    pub transaction: Transaction,
+    pub error: String,
 }
 
 impl Jib {
@@ -230,7 +274,7 @@ impl Jib {
     }
 
     /// Pack the instructions into transactions and submit them to the network via the TPU client. This will return a spinner while the transactions are being submitted.
-    pub fn hoist(mut self) -> Result<(), JibError> {
+    pub fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
         let packed_transactions = self.pack()?;
 
         let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
@@ -241,10 +285,206 @@ impl Jib {
             .map(|tx| tx.message.clone())
             .collect::<Vec<_>>();
 
-        self.tpu_client
+        let results = self
             .send_and_confirm_messages_with_spinner(messages.as_slice(), &signers)
-            .map_err(|_| JibError::TransactionError)?;
+            .map_err(|e| JibError::TransactionError(e.to_string()))?;
 
-        Ok(())
+        Ok(results)
     }
+
+    /// Submit pre-packed transactions to the network via the TPU client. This will return a spinner while the transactions are being submitted.
+    pub fn submit_packed_transactions(
+        self,
+        transactions: Vec<Transaction>,
+    ) -> Result<Vec<JibResult>, JibError> {
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        let messages = transactions
+            .as_slice()
+            .iter()
+            .map(|tx| tx.message.clone())
+            .collect::<Vec<_>>();
+
+        let results = self
+            .send_and_confirm_messages_with_spinner(messages.as_slice(), &signers)
+            .map_err(|e| JibError::TransactionError(e.to_string()))?;
+
+        Ok(results)
+    }
+
+    // Pulled from tpu_client code and modified to return Jib results for better error handling and retrying failed transactions.
+    fn send_and_confirm_messages_with_spinner<T: Signers>(
+        &self,
+        messages: &[Message],
+        signers: &T,
+    ) -> Result<Vec<JibResult>, TpuSenderError> {
+        let mut expired_blockhash_retries = 5;
+
+        let progress_bar = new_progress_bar();
+        progress_bar.set_message("Setting up...");
+
+        let mut jib_results = Vec::with_capacity(messages.len());
+
+        let mut transactions = messages
+            .iter()
+            .enumerate()
+            .map(|(i, message)| (i, Transaction::new_unsigned(message.clone())))
+            .collect::<Vec<_>>();
+
+        let total_transactions = transactions.len();
+
+        let mut transaction_errors = vec![None; transactions.len()];
+        let mut confirmed_transactions = 0;
+        let mut block_height = self.rpc_client().get_block_height()?;
+
+        while expired_blockhash_retries > 0 {
+            let (blockhash, last_valid_block_height) = self
+                .rpc_client()
+                .get_latest_blockhash_with_commitment(self.rpc_client().commitment())?;
+
+            let mut pending_transactions: HashMap<Signature, (usize, Transaction)> = HashMap::new();
+            for (i, ref mut transaction) in &mut transactions {
+                transaction.try_sign(signers, blockhash)?;
+                pending_transactions.insert(transaction.signatures[0], (*i, transaction.clone()));
+            }
+
+            let mut last_resend = Instant::now() - TRANSACTION_RESEND_INTERVAL;
+            while block_height <= last_valid_block_height {
+                let num_transactions = pending_transactions.len();
+
+                // Periodically re-send all pending transactions
+                if Instant::now().duration_since(last_resend) > TRANSACTION_RESEND_INTERVAL {
+                    for (index, (_i, transaction)) in pending_transactions.values().enumerate() {
+                        if !self.tpu_client.send_transaction(transaction) {
+                            let _result = self.rpc_client().send_transaction(transaction).ok();
+                        }
+                        set_message_for_confirmed_transactions(
+                            &progress_bar,
+                            confirmed_transactions,
+                            total_transactions,
+                            None, //block_height,
+                            last_valid_block_height,
+                            &format!("Sending {}/{} transactions", index + 1, num_transactions,),
+                        );
+                        sleep(SEND_TRANSACTION_INTERVAL);
+                    }
+                    last_resend = Instant::now();
+                }
+
+                // Wait for the next block before checking for transaction statuses
+                let mut block_height_refreshes = 10;
+                set_message_for_confirmed_transactions(
+                    &progress_bar,
+                    confirmed_transactions,
+                    total_transactions,
+                    Some(block_height),
+                    last_valid_block_height,
+                    &format!("Waiting for next block, {} pending...", num_transactions),
+                );
+                let mut new_block_height = block_height;
+                while block_height == new_block_height && block_height_refreshes > 0 {
+                    sleep(Duration::from_millis(500));
+                    new_block_height = self.rpc_client().get_block_height()?;
+                    block_height_refreshes -= 1;
+                }
+                block_height = new_block_height;
+
+                // Collect statuses for the transactions, drop those that are confirmed
+                let pending_signatures = pending_transactions.keys().cloned().collect::<Vec<_>>();
+                for pending_signatures_chunk in
+                    pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
+                {
+                    if let Ok(result) = self
+                        .rpc_client()
+                        .get_signature_statuses(pending_signatures_chunk)
+                    {
+                        let statuses = result.value;
+                        for (signature, status) in
+                            pending_signatures_chunk.iter().zip(statuses.into_iter())
+                        {
+                            if let Some(status) = status {
+                                if status.satisfies_commitment(self.rpc_client().commitment()) {
+                                    if let Some((i, _)) = pending_transactions.remove(signature) {
+                                        confirmed_transactions += 1;
+                                        if status.err.is_some() {
+                                            progress_bar.println(format!(
+                                                "Failed transaction: {:?}",
+                                                status
+                                            ));
+                                            jib_results.push(JibResult::Failure(
+                                                JibFailedTransaction {
+                                                    transaction: transactions[i].1.clone(),
+                                                    error: status.err.clone().unwrap().to_string(),
+                                                },
+                                            ));
+                                        } else {
+                                            jib_results
+                                                .push(JibResult::Success(signature.to_string()));
+                                        }
+                                        transaction_errors[i] = status.err;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    set_message_for_confirmed_transactions(
+                        &progress_bar,
+                        confirmed_transactions,
+                        total_transactions,
+                        Some(block_height),
+                        last_valid_block_height,
+                        "Checking transaction status...",
+                    );
+                }
+
+                if pending_transactions.is_empty() {
+                    return Ok(jib_results);
+                }
+            }
+
+            transactions = pending_transactions.into_values().collect();
+            progress_bar.println(format!(
+                "Blockhash expired. {} retries remaining",
+                expired_blockhash_retries
+            ));
+            expired_blockhash_retries -= 1;
+        }
+        Err(TpuSenderError::Custom("Max retries exceeded".into()))
+    }
+}
+
+use indicatif::{ProgressBar, ProgressStyle};
+
+fn new_progress_bar() -> ProgressBar {
+    let progress_bar = ProgressBar::new(42);
+    progress_bar.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {wide_msg}")
+            .unwrap(),
+    );
+    progress_bar.enable_steady_tick(Duration::from_millis(100));
+    progress_bar
+}
+
+fn set_message_for_confirmed_transactions(
+    progress_bar: &ProgressBar,
+    confirmed_transactions: u32,
+    total_transactions: usize,
+    block_height: Option<u64>,
+    last_valid_block_height: u64,
+    status: &str,
+) {
+    progress_bar.set_message(format!(
+        "{:>5.1}% | {:<40}{}",
+        confirmed_transactions as f64 * 100. / total_transactions as f64,
+        status,
+        match block_height {
+            Some(block_height) => format!(
+                " [block height {}; re-sign in {} blocks]",
+                block_height,
+                last_valid_block_height.saturating_sub(block_height),
+            ),
+            None => String::new(),
+        },
+    ));
 }
