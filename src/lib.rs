@@ -61,6 +61,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use solana_client::{
     nonblocking::tpu_client::TpuSenderError,
@@ -453,8 +454,7 @@ impl Jib {
     }
 }
 
-use indicatif::{ProgressBar, ProgressStyle};
-
+// Pulled from tpu_client to support 'send_and_confirm_messages_with_spinner' function.
 fn new_progress_bar() -> ProgressBar {
     let progress_bar = ProgressBar::new(42);
     progress_bar.set_style(
