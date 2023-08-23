@@ -164,6 +164,20 @@ impl JibResult {
     pub fn is_failure(&self) -> bool {
         !self.is_success()
     }
+
+    pub fn transaction(&self) -> Option<Transaction> {
+        match self {
+            JibResult::Success(_) => None,
+            JibResult::Failure(f) => Some(f.transaction.clone()),
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        match self {
+            JibResult::Success(_) => None,
+            JibResult::Failure(f) => Some(f.error.clone()),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
