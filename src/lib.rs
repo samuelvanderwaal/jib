@@ -178,6 +178,13 @@ impl JibResult {
             JibResult::Failure(f) => Some(f.error.clone()),
         }
     }
+
+    pub fn signature(&self) -> Option<String> {
+        match self {
+            JibResult::Success(s) => Some(s.clone()),
+            JibResult::Failure(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
