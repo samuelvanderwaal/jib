@@ -45,9 +45,18 @@ fn main() -> Result<()> {
 
     // Set the instructions to be executed.
     jib.set_instructions(instructions);
-    
+
     // Run it.
-    jib.hoist()?;
+    let results = jib.hoist()?;
+
+    // Do something with the results.
+    for result in results {
+        if result.is_success() {
+            println!("Success: {}", result.signature().unwrap());
+        } else {
+            println!("Failure: {}", result.error().unwrap());
+        }
+    }
 
     Ok(())
 }

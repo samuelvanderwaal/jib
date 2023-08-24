@@ -47,7 +47,16 @@
 //!     jib.set_instructions(instructions);
 //!
 //!     // Run it.
-//!     jib.hoist()?;
+//!     let results = jib.hoist()?;
+//!
+//!     // Do something with the results.
+//!     for result in results {
+//!         if result.is_success() {
+//!             println!("Success: {}", result.signature().unwrap());
+//!         } else {
+//!             println!("Failure: {}", result.error().unwrap());
+//!         }
+//!     }
 //!
 //!     Ok(())
 //! }
@@ -86,12 +95,12 @@ use error::JibError;
 
 const MAX_TX_LEN: usize = 1232;
 
-/// Send at ~100 TPS
+// Send at ~100 TPS
 const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(10);
-/// Retry batch send after 4 seconds
+// Retry batch send after 4 seconds
 const TRANSACTION_RESEND_INTERVAL: Duration = Duration::from_secs(4);
 
-/// The Network enum is used to set the RPC URL to use for the transactions.
+/// The Network enum is used to set the RPC URL to use for finding the current leader.
 /// The default value is Devnet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Network {
@@ -147,13 +156,17 @@ pub struct Jib {
     ixes: Vec<Instruction>,
 }
 
+/// A library Result value indicating Success or Failure and containing information about each result type.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JibResult {
+    /// The transaction was successful and contains the signature of the transaction.
     Success(String),
+    /// The transaction failed and contains the transaction and error message.
     Failure(JibFailedTransaction),
 }
 
 impl JibResult {
+    /// Returns true if the result is a success.
     pub fn is_success(&self) -> bool {
         match self {
             JibResult::Success(_) => true,
@@ -161,10 +174,12 @@ impl JibResult {
         }
     }
 
+    /// Returns true if the result is a failure.
     pub fn is_failure(&self) -> bool {
         !self.is_success()
     }
 
+    /// Parses the transaction from a failure or returns None if the result is a success.
     pub fn transaction(&self) -> Option<Transaction> {
         match self {
             JibResult::Success(_) => None,
@@ -172,6 +187,7 @@ impl JibResult {
         }
     }
 
+    /// Parses the error message from a failure or returns None if the result is a success.
     pub fn error(&self) -> Option<String> {
         match self {
             JibResult::Success(_) => None,
@@ -179,6 +195,7 @@ impl JibResult {
         }
     }
 
+    /// Parses the signature from a success or returns None if the result is a failure.
     pub fn signature(&self) -> Option<String> {
         match self {
             JibResult::Success(s) => Some(s.clone()),
@@ -187,6 +204,7 @@ impl JibResult {
     }
 }
 
+/// A failed transaction with the error message.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JibFailedTransaction {
     pub transaction: Transaction,
@@ -295,7 +313,8 @@ impl Jib {
         Ok(packed_transactions)
     }
 
-    /// Pack the instructions into transactions and submit them to the network via the TPU client. This will return a spinner while the transactions are being submitted.
+    /// Pack the instructions into transactions and submit them to the network via the TPU client.
+    /// This will display a spinner while the transactions are being submitted.
     pub fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
         let packed_transactions = self.pack()?;
 
@@ -314,7 +333,7 @@ impl Jib {
         Ok(results)
     }
 
-    /// Submit pre-packed transactions to the network via the TPU client. This will return a spinner while the transactions are being submitted.
+    /// Submit pre-packed transactions to the network via the TPU client. This will display a spinner while the transactions are being submitted.
     pub fn submit_packed_transactions(
         self,
         transactions: Vec<Transaction>,
@@ -475,7 +494,8 @@ impl Jib {
     }
 }
 
-// Pulled from tpu_client to support 'send_and_confirm_messages_with_spinner' function.
+/* Pulled from tpu_client to support 'send_and_confirm_messages_with_spinner' function. */
+
 fn new_progress_bar() -> ProgressBar {
     let progress_bar = ProgressBar::new(42);
     progress_bar.set_style(
