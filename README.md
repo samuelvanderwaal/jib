@@ -1,3 +1,7 @@
+[![Crate](https://img.shields.io/crates/v/jib)](https://crates.io/crates/jib)
+[![Downloads](https://img.shields.io/crates/d/jib)](https://crates.io/crates/jib)
+[![License](https://img.shields.io/crates/l/jib)](https://github.com/samuelvanderwaal/jib/blob/main/LICENSE)
+
 # Jib
 
 Jib is a simple Rust library that efficiently packs a vector of Solana instructions into maximum size and account length transactions
