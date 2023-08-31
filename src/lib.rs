@@ -78,6 +78,7 @@ use solana_client::{
     rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
     tpu_client::{TpuClient, TpuClientConfig},
 };
+use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::Instruction,
@@ -151,7 +152,7 @@ impl Network {
 /// It is used to create a new Jib instance, set the RPC URL, set the instructions, pack the instructions into transactions
 /// and finally submit the transactions to the network.
 pub struct Jib {
-    tpu_client: TpuClient,
+    tpu_client: TpuClient<QuicPool, QuicConnectionManager, QuicConfig>,
     signers: Vec<Keypair>,
     ixes: Vec<Instruction>,
 }
@@ -223,7 +224,9 @@ impl Jib {
         })
     }
 
-    fn create_tpu_client(url: &str) -> Result<TpuClient, JibError> {
+    fn create_tpu_client(
+        url: &str,
+    ) -> Result<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>, JibError> {
         let rpc_client = Arc::new(RpcClient::new_with_commitment(
             url.to_string(),
             CommitmentConfig::confirmed(),
