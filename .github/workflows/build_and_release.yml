@@ -10,8 +10,6 @@ on:
       - 'v*.*.*'
 
 jobs:
-  permissions:
-    contents: write
   build:
     strategy:
       matrix:
