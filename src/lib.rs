@@ -81,6 +81,7 @@ use solana_client::{
 use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
 use solana_sdk::{
     commitment_config::CommitmentConfig,
+    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     message::Message,
     signature::{Keypair, Signature},
@@ -155,6 +156,8 @@ pub struct Jib {
     tpu_client: TpuClient<QuicPool, QuicConnectionManager, QuicConfig>,
     signers: Vec<Keypair>,
     ixes: Vec<Instruction>,
+    compute_budget: u32,
+    priority_fee: u64,
 }
 
 /// A library Result value indicating Success or Failure and containing information about each result type.
@@ -221,6 +224,8 @@ impl Jib {
             tpu_client,
             signers,
             ixes: Vec::new(),
+            compute_budget: 200_000,
+            priority_fee: 0,
         })
     }
 
@@ -255,6 +260,16 @@ impl Jib {
         self.signers = signers;
     }
 
+    /// Set the compute budget to use for the transactions. This defaults to 200,000.
+    pub fn set_compute_budget(&mut self, compute_budget: u32) {
+        self.compute_budget = compute_budget;
+    }
+
+    /// Set the priority fee to use for the transactions. This defaults to 0.
+    pub fn set_priority_fee(&mut self, priority_fee: u64) {
+        self.priority_fee = priority_fee;
+    }
+
     /// Get the RPC client that is being used by the Jib instance.
     pub fn rpc_client(&self) -> &RpcClient {
         self.tpu_client.rpc_client()
@@ -280,6 +295,17 @@ impl Jib {
         let mut instructions = Vec::new();
         let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
 
+        if self.compute_budget != 200_000 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                self.compute_budget,
+            ));
+        }
+        if self.priority_fee != 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.priority_fee,
+            ));
+        }
+
         let mut current_transaction =
             Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
         let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
@@ -303,8 +329,20 @@ impl Jib {
                 packed_transactions.push(current_transaction.clone());
                 debug!("Packed instructions: {}", instructions.len());
 
-                // clear instructions except for last one
-                instructions = vec![ix.clone()];
+                // Clear instructions except for the last one that pushed the transaction over the size limit.
+                // Check for compute budget and priority fees again and add them to the front of the instructions.
+                instructions = vec![];
+                if self.compute_budget != 200_000 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                        self.compute_budget,
+                    ));
+                }
+                if self.priority_fee != 0 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                        self.priority_fee,
+                    ));
+                }
+                instructions.push(ix.clone());
             } else {
                 current_transaction = tx;
             }
