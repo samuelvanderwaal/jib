@@ -260,12 +260,14 @@ impl Jib {
         self.signers = signers;
     }
 
-    /// Set the compute budget to use for the transactions. This defaults to 200,000.
+    /// Set the compute budget to use for the transactions. If not set
+    /// no compute budget is set which defaults to the system standard of 200,000.
     pub fn set_compute_budget(&mut self, compute_budget: u32) {
         self.compute_budget = compute_budget;
     }
 
-    /// Set the priority fee to use for the transactions. This defaults to 0.
+    /// Set the priority fee to use for the transactions. If not set no priority fee
+    /// is set. Units are micro-lamports per compute unit.
     pub fn set_priority_fee(&mut self, priority_fee: u64) {
         self.priority_fee = priority_fee;
     }
