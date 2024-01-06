@@ -70,7 +70,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use solana_client::{
     nonblocking::tpu_client::TpuSenderError,
@@ -368,30 +368,14 @@ impl Jib {
     pub fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
         let packed_transactions = self.pack()?;
 
-        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
-
-        let messages = packed_transactions
-            .as_slice()
-            .iter()
-            .map(|tx| tx.message.clone())
-            .collect::<Vec<_>>();
-
-        let mut results = vec![];
-
-        for chunk in messages.chunks(self.batch_size) {
-            let res = self
-                .send_and_confirm_messages_with_spinner(chunk, &signers)
-                .map_err(|e| JibError::TransactionError(e.to_string()))?;
-
-            results.extend(res);
-        }
+        let results = self.submit_packed_transactions(packed_transactions)?;
 
         Ok(results)
     }
 
     /// Submit pre-packed transactions to the network via the TPU client. This will display a spinner while the transactions are being submitted.
     pub fn submit_packed_transactions(
-        self,
+        &mut self,
         transactions: Vec<Transaction>,
     ) -> Result<Vec<JibResult>, JibError> {
         let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
@@ -402,9 +386,28 @@ impl Jib {
             .map(|tx| tx.message.clone())
             .collect::<Vec<_>>();
 
-        let results = self
-            .send_and_confirm_messages_with_spinner(messages.as_slice(), &signers)
-            .map_err(|e| JibError::TransactionError(e.to_string()))?;
+        let mut results = vec![];
+
+        let mpb = MultiProgress::new();
+        let pb = mpb.add(ProgressBar::new(messages.len() as u64));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.blue} {msg} {wide_bar:.cyan/blue} {pos:>7}/{len:7} {eta_precise}",
+                )
+                .unwrap(),
+        );
+        pb.set_message("Sending transactions");
+
+        for chunk in messages.chunks(self.batch_size) {
+            let res = self
+                .send_and_confirm_messages_with_spinner(chunk, &signers, &mpb)
+                .map_err(|e| JibError::TransactionError(e.to_string()))?;
+
+            results.extend(res);
+
+            pb.inc(chunk.len() as u64);
+        }
 
         Ok(results)
     }
@@ -414,11 +417,17 @@ impl Jib {
         &self,
         messages: &[Message],
         signers: &T,
+        mpb: &MultiProgress,
     ) -> Result<Vec<JibResult>, TpuSenderError> {
         let mut expired_blockhash_retries = 5;
 
-        let progress_bar = new_progress_bar();
-        progress_bar.set_message("Setting up...");
+        let spinner = mpb.add(ProgressBar::new(42));
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {wide_msg}")
+                .unwrap(),
+        );
+        spinner.enable_steady_tick(Duration::from_millis(100));
 
         let mut jib_results = Vec::with_capacity(messages.len());
 
@@ -456,7 +465,7 @@ impl Jib {
                             let _result = self.rpc_client().send_transaction(transaction).ok();
                         }
                         set_message_for_confirmed_transactions(
-                            &progress_bar,
+                            &spinner,
                             confirmed_transactions,
                             total_transactions,
                             None, //block_height,
@@ -471,7 +480,7 @@ impl Jib {
                 // Wait for the next block before checking for transaction statuses
                 let mut block_height_refreshes = 10;
                 set_message_for_confirmed_transactions(
-                    &progress_bar,
+                    &spinner,
                     confirmed_transactions,
                     total_transactions,
                     Some(block_height),
@@ -504,7 +513,7 @@ impl Jib {
                                     if let Some((i, _)) = pending_transactions.remove(signature) {
                                         confirmed_transactions += 1;
                                         if status.err.is_some() {
-                                            progress_bar.println(format!(
+                                            spinner.println(format!(
                                                 "Failed transaction: {:?}",
                                                 status
                                             ));
@@ -525,7 +534,7 @@ impl Jib {
                         }
                     }
                     set_message_for_confirmed_transactions(
-                        &progress_bar,
+                        &spinner,
                         confirmed_transactions,
                         total_transactions,
                         Some(block_height),
@@ -540,7 +549,7 @@ impl Jib {
             }
 
             transactions = pending_transactions.into_values().collect();
-            progress_bar.println(format!(
+            spinner.println(format!(
                 "Blockhash expired. {} retries remaining",
                 expired_blockhash_retries
             ));
@@ -551,18 +560,6 @@ impl Jib {
 }
 
 /* Pulled from tpu_client to support 'send_and_confirm_messages_with_spinner' function. */
-
-fn new_progress_bar() -> ProgressBar {
-    let progress_bar = ProgressBar::new(42);
-    progress_bar.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {wide_msg}")
-            .unwrap(),
-    );
-    progress_bar.enable_steady_tick(Duration::from_millis(100));
-    progress_bar
-}
-
 fn set_message_for_confirmed_transactions(
     progress_bar: &ProgressBar,
     confirmed_transactions: u32,
