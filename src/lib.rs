@@ -158,6 +158,7 @@ pub struct Jib {
     ixes: Vec<Instruction>,
     compute_budget: u32,
     priority_fee: u64,
+    batch_size: usize,
 }
 
 /// A library Result value indicating Success or Failure and containing information about each result type.
@@ -226,6 +227,7 @@ impl Jib {
             ixes: Vec::new(),
             compute_budget: 200_000,
             priority_fee: 0,
+            batch_size: 10,
         })
     }
 
@@ -270,6 +272,11 @@ impl Jib {
     /// is set. Units are micro-lamports per compute unit.
     pub fn set_priority_fee(&mut self, priority_fee: u64) {
         self.priority_fee = priority_fee;
+    }
+
+    /// Set the batch size to use for the transactions. This defaults to 10.
+    pub fn set_batch_size(&mut self, batch_size: usize) {
+        self.batch_size = batch_size;
     }
 
     /// Get the RPC client that is being used by the Jib instance.
@@ -369,9 +376,15 @@ impl Jib {
             .map(|tx| tx.message.clone())
             .collect::<Vec<_>>();
 
-        let results = self
-            .send_and_confirm_messages_with_spinner(messages.as_slice(), &signers)
-            .map_err(|e| JibError::TransactionError(e.to_string()))?;
+        let mut results = vec![];
+
+        for chunk in messages.chunks(self.batch_size) {
+            let res = self
+                .send_and_confirm_messages_with_spinner(chunk, &signers)
+                .map_err(|e| JibError::TransactionError(e.to_string()))?;
+
+            results.extend(res);
+        }
 
         Ok(results)
     }
