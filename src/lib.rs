@@ -62,31 +62,30 @@
 //! }
 //! ```
 
-use std::{
-    collections::HashMap,
-    str::FromStr,
-    sync::Arc,
-    thread::sleep,
-    time::{Duration, Instant},
+use std::{str::FromStr, sync::Arc, time::Duration};
+
+#[cfg(feature = "tpu")]
+use {
+    bincode::config,
+    indicatif::{MultiProgress, ProgressStyle},
+    solana_client::{
+        rpc_client::RpcClient as BlockingRpcClient,
+        rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
+        tpu_client::{TpuClient, TpuClientConfig, TpuSenderError},
+    },
+    solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
+    solana_sdk::{signature::Signature, signers::Signers},
+    std::{collections::HashMap, thread::sleep, time::Instant},
 };
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use futures_util::{stream::FuturesOrdered, StreamExt};
+use indicatif::ProgressBar;
+use ratelimit::Ratelimiter;
 use serde::{Deserialize, Serialize};
-use solana_client::{
-    nonblocking::tpu_client::TpuSenderError,
-    rpc_client::RpcClient,
-    rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
-    tpu_client::{TpuClient, TpuClientConfig},
-};
-use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
-    message::Message,
-    signature::{Keypair, Signature},
-    signer::Signer,
-    signers::Signers,
+    commitment_config::CommitmentConfig, compute_budget::ComputeBudgetInstruction,
+    instruction::Instruction, message::Message, signature::Keypair, signer::Signer,
     transaction::Transaction,
 };
 use tracing::debug;
@@ -98,8 +97,10 @@ use error::JibError;
 const MAX_TX_LEN: usize = 1232;
 
 // Send at ~100 TPS
+#[cfg(feature = "tpu")]
 const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(10);
 // Retry batch send after 4 seconds
+#[cfg(feature = "tpu")]
 const TRANSACTION_RESEND_INTERVAL: Duration = Duration::from_secs(4);
 
 /// The Network enum is used to set the RPC URL to use for finding the current leader.
@@ -153,12 +154,15 @@ impl Network {
 /// It is used to create a new Jib instance, set the RPC URL, set the instructions, pack the instructions into transactions
 /// and finally submit the transactions to the network.
 pub struct Jib {
-    tpu_client: TpuClient<QuicPool, QuicConnectionManager, QuicConfig>,
+    #[cfg(feature = "tpu")]
+    tpu_client: Option<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>>,
+    client: Arc<RpcClient>,
     signers: Vec<Keypair>,
     ixes: Vec<Instruction>,
     compute_budget: u32,
     priority_fee: u64,
     batch_size: usize,
+    rate_limit: u64,
 }
 
 /// A library Result value indicating Success or Failure and containing information about each result type.
@@ -184,11 +188,11 @@ impl JibResult {
         !self.is_success()
     }
 
-    /// Parses the transaction from a failure or returns None if the result is a success.
-    pub fn transaction(&self) -> Option<Transaction> {
+    /// Parses the message from a failure or returns None if the result is a success.
+    pub fn message(&self) -> Option<Message> {
         match self {
             JibResult::Success(_) => None,
-            JibResult::Failure(f) => Some(f.transaction.clone()),
+            JibResult::Failure(f) => Some(f.message.clone()),
         }
     }
 
@@ -212,29 +216,32 @@ impl JibResult {
 /// A failed transaction with the error message.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JibFailedTransaction {
-    pub transaction: Transaction,
+    pub message: Message,
     pub error: String,
 }
 
 impl Jib {
     /// Create a new Jib instance. You should pass in all the signers you want to use for the transactions.
-    pub fn new(signers: Vec<Keypair>, network: Network) -> Result<Self, JibError> {
-        let tpu_client = Self::create_tpu_client(network.url())?;
+    pub fn new(signers: Vec<Keypair>, rpc_url: String) -> Result<Self, JibError> {
+        let client = Arc::new(RpcClient::new_with_commitment(
+            rpc_url,
+            CommitmentConfig::confirmed(),
+        ));
 
         Ok(Self {
-            tpu_client,
+            client,
             signers,
             ixes: Vec::new(),
             compute_budget: 200_000,
             priority_fee: 0,
             batch_size: 10,
+            rate_limit: 10,
         })
     }
 
-    fn create_tpu_client(
-        url: &str,
-    ) -> Result<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>, JibError> {
-        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+    #[cfg(feature = "tpu")]
+    pub fn create_tpu_client(&mut self, url: &str) -> Result<(), JibError> {
+        let rpc_client = Arc::new(BlockingRpcClient::new_with_commitment(
             url.to_string(),
             CommitmentConfig::confirmed(),
         ));
@@ -244,13 +251,14 @@ impl Jib {
         let tpu_client = TpuClient::new(rpc_client, &wss, tpu_config)
             .map_err(|e| JibError::FailedToCreateTpuClient(e.to_string()))?;
 
-        Ok(tpu_client)
+        self.tpu_client = Some(tpu_client);
+        Ok(())
     }
 
     /// Set the RPC URL to use for the transactions. This defaults to the public devnet URL.
-    pub fn set_rpc_url(&mut self, url: &str) {
-        self.tpu_client = Self::create_tpu_client(url).unwrap();
-    }
+    // pub fn set_rpc_url(&mut self, url: &str) {
+    //     self.tpu_client = Self::create_tpu_client(url).unwrap();
+    // }
 
     /// Set the instructions to use for the transactions. This should be a vector of instructions that you wish to submit to the network.
     pub fn set_instructions(&mut self, ixes: Vec<Instruction>) {
@@ -279,10 +287,15 @@ impl Jib {
         self.batch_size = batch_size;
     }
 
-    /// Get the RPC client that is being used by the Jib instance.
-    pub fn rpc_client(&self) -> &RpcClient {
-        self.tpu_client.rpc_client()
+    /// Set the rate limit to use for the transactions. This defaults to 10.
+    pub fn set_rate_limit(&mut self, rate_limit: u64) {
+        self.rate_limit = rate_limit;
     }
+
+    /// Get the RPC client that is being used by the Jib instance.
+    // pub fn rpc_client(&self) -> &RpcClient {
+    //     self.tpu_client.rpc_client()
+    // }
 
     /// Get the first signer that is being used by the Jib instance, the transaction fee payer.
     pub fn payer(&self) -> &Keypair {
@@ -290,11 +303,7 @@ impl Jib {
     }
 
     /// Pack the instructions into transactions. This will return a vector of transactions that can be submitted to the network.
-    pub fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
-        debug!(
-            "Commitment level: {:?}",
-            self.tpu_client.rpc_client().commitment()
-        );
+    pub async fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
         if self.ixes.is_empty() {
             return Err(JibError::NoInstructions);
         }
@@ -320,9 +329,9 @@ impl Jib {
         let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
 
         let latest_blockhash = self
-            .tpu_client
-            .rpc_client()
+            .client
             .get_latest_blockhash()
+            .await
             .map_err(|_| JibError::NoRecentBlockhash)?;
 
         for ix in self.ixes.iter_mut() {
@@ -363,18 +372,106 @@ impl Jib {
         Ok(packed_transactions)
     }
 
+    /// Used to repack failed transactions into new transactions with a fresh blockhash and signatures.
+    /// These transacations can be resubmitted with `sail_with_transactions`.
+    pub async fn repack_failed(
+        &mut self,
+        failed_transactions: Vec<JibFailedTransaction>,
+    ) -> Result<Vec<Transaction>, JibError> {
+        let mut packed_transactions = Vec::new();
+
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        for tx in failed_transactions {
+            let mut tx = Transaction::new_unsigned(tx.message);
+            let blockhash = self
+                .client
+                .get_latest_blockhash()
+                .await
+                .map_err(|_| JibError::NoRecentBlockhash)?;
+            tx.sign(&signers, blockhash);
+
+            packed_transactions.push(tx);
+        }
+
+        Ok(packed_transactions)
+    }
+
+    /// Pack the instructions and submit them to the network. This will return a vector of results.
+    pub async fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
+        let packed_transactions = self.pack().await?;
+
+        let results = self._hoist(packed_transactions).await?;
+
+        Ok(results)
+    }
+
+    async fn _hoist(
+        &mut self,
+        packed_transactions: Vec<Transaction>,
+    ) -> Result<Vec<JibResult>, JibError> {
+        let mut tasks = FuturesOrdered::new();
+
+        let pb = ProgressBar::new(packed_transactions.len() as u64);
+
+        let ratelimiter = Ratelimiter::builder(self.rate_limit, Duration::from_secs(1))
+            .max_tokens(self.rate_limit)
+            .initial_available(self.rate_limit)
+            .build()
+            .unwrap();
+
+        for tx in packed_transactions {
+            let pb = pb.clone();
+            let client = Arc::clone(&self.client);
+
+            // Wait for the ratelimiter to allow the transaction to be sent.
+            if let Err(sleep) = ratelimiter.try_wait() {
+                tokio::time::sleep(sleep).await;
+                continue;
+            }
+
+            let task = tokio::spawn(async move {
+                let res = client.send_and_confirm_transaction(&tx.clone()).await;
+                pb.inc(1);
+                match res {
+                    Ok(signature) => JibResult::Success(signature.to_string()),
+                    Err(e) => JibResult::Failure(JibFailedTransaction {
+                        message: tx.message.clone(),
+                        error: e.to_string(),
+                    }),
+                }
+            });
+            tasks.push_back(task);
+        }
+
+        let mut results = Vec::new();
+
+        while let Some(result) = tasks.next().await {
+            match result {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    return Err(JibError::TransactionError(e.to_string()));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Pack the instructions into transactions and submit them to the network via the TPU client.
     /// This will display a spinner while the transactions are being submitted.
-    pub fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
-        let packed_transactions = self.pack()?;
+    #[cfg(feature = "tpu")]
+    pub async fn hoist_via_tpu(&mut self) -> Result<Vec<JibResult>, JibError> {
+        let packed_transactions = self.pack().await?;
 
-        let results = self.submit_packed_transactions(packed_transactions)?;
+        let results = self.submit_packed_transactions(packed_transactions).await?;
 
         Ok(results)
     }
 
     /// Submit pre-packed transactions to the network via the TPU client. This will display a spinner while the transactions are being submitted.
-    pub fn submit_packed_transactions(
+    #[cfg(feature = "tpu")]
+    pub async fn submit_packed_transactions(
         &mut self,
         transactions: Vec<Transaction>,
     ) -> Result<Vec<JibResult>, JibError> {
@@ -402,6 +499,7 @@ impl Jib {
         for chunk in messages.chunks(self.batch_size) {
             let res = self
                 .send_and_confirm_messages_with_spinner(chunk, &signers, &mpb)
+                .await
                 .map_err(|e| JibError::TransactionError(e.to_string()))?;
 
             results.extend(res);
@@ -413,12 +511,17 @@ impl Jib {
     }
 
     // Pulled from tpu_client code and modified to return Jib results for better error handling and retrying failed transactions.
-    fn send_and_confirm_messages_with_spinner<T: Signers>(
+    #[cfg(feature = "tpu")]
+    async fn send_and_confirm_messages_with_spinner<T: Signers>(
         &self,
         messages: &[Message],
         signers: &T,
         mpb: &MultiProgress,
     ) -> Result<Vec<JibResult>, TpuSenderError> {
+        let tpu_client = self.tpu_client.as_ref().ok_or(TpuSenderError::Custom(
+            "TPU client not initialized".to_string(),
+        ))?;
+
         let mut expired_blockhash_retries = 5;
 
         let spinner = mpb.add(ProgressBar::new(42));
@@ -441,12 +544,13 @@ impl Jib {
 
         let mut transaction_errors = vec![None; transactions.len()];
         let mut confirmed_transactions = 0;
-        let mut block_height = self.rpc_client().get_block_height()?;
+        let mut block_height = self.client.get_block_height().await?;
 
         while expired_blockhash_retries > 0 {
             let (blockhash, last_valid_block_height) = self
-                .rpc_client()
-                .get_latest_blockhash_with_commitment(self.rpc_client().commitment())?;
+                .client
+                .get_latest_blockhash_with_commitment(self.client.commitment())
+                .await?;
 
             let mut pending_transactions: HashMap<Signature, (usize, Transaction)> = HashMap::new();
             for (i, ref mut transaction) in &mut transactions {
@@ -461,8 +565,8 @@ impl Jib {
                 // Periodically re-send all pending transactions
                 if Instant::now().duration_since(last_resend) > TRANSACTION_RESEND_INTERVAL {
                     for (index, (_i, transaction)) in pending_transactions.values().enumerate() {
-                        if !self.tpu_client.send_transaction(transaction) {
-                            let _result = self.rpc_client().send_transaction(transaction).ok();
+                        if !tpu_client.send_transaction(transaction) {
+                            let _result = self.client.send_transaction(transaction).await.ok();
                         }
                         set_message_for_confirmed_transactions(
                             &spinner,
@@ -490,7 +594,7 @@ impl Jib {
                 let mut new_block_height = block_height;
                 while block_height == new_block_height && block_height_refreshes > 0 {
                     sleep(Duration::from_millis(500));
-                    new_block_height = self.rpc_client().get_block_height()?;
+                    new_block_height = self.client.get_block_height().await?;
                     block_height_refreshes -= 1;
                 }
                 block_height = new_block_height;
@@ -501,15 +605,16 @@ impl Jib {
                     pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
                 {
                     if let Ok(result) = self
-                        .rpc_client()
+                        .client
                         .get_signature_statuses(pending_signatures_chunk)
+                        .await
                     {
                         let statuses = result.value;
                         for (signature, status) in
                             pending_signatures_chunk.iter().zip(statuses.into_iter())
                         {
                             if let Some(status) = status {
-                                if status.satisfies_commitment(self.rpc_client().commitment()) {
+                                if status.satisfies_commitment(self.client.commitment()) {
                                     if let Some((i, _)) = pending_transactions.remove(signature) {
                                         confirmed_transactions += 1;
                                         if status.err.is_some() {
@@ -519,7 +624,7 @@ impl Jib {
                                             ));
                                             jib_results.push(JibResult::Failure(
                                                 JibFailedTransaction {
-                                                    transaction: transactions[i].1.clone(),
+                                                    message: transactions[i].1.message.clone(),
                                                     error: status.err.clone().unwrap().to_string(),
                                                 },
                                             ));
@@ -560,6 +665,7 @@ impl Jib {
 }
 
 /* Pulled from tpu_client to support 'send_and_confirm_messages_with_spinner' function. */
+#[cfg(feature = "tpu")]
 fn set_message_for_confirmed_transactions(
     progress_bar: &ProgressBar,
     confirmed_transactions: u32,
