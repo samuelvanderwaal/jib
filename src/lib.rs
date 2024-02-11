@@ -66,7 +66,6 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(feature = "tpu")]
 use {
-    bincode::config,
     indicatif::{MultiProgress, ProgressStyle},
     solana_client::{
         rpc_client::RpcClient as BlockingRpcClient,
@@ -74,7 +73,7 @@ use {
         tpu_client::{TpuClient, TpuClientConfig, TpuSenderError},
     },
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
-    solana_sdk::{signature::Signature, signers::Signers},
+    solana_sdk::signers::Signers,
     std::{collections::HashMap, thread::sleep, time::Instant},
 };
 
@@ -84,13 +83,9 @@ use ratelimit::Ratelimiter;
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
-    message::Message,
-    signature::{Keypair, Signature},
-    signer::Signer,
-    transaction::Transaction,
+    commitment_config::CommitmentConfig, compute_budget::ComputeBudgetInstruction,
+    instruction::Instruction, message::Message, signature::Keypair, signature::Signature,
+    signer::Signer, transaction::Transaction,
 };
 use tracing::debug;
 
@@ -99,6 +94,8 @@ mod error;
 use error::JibError;
 
 const MAX_TX_LEN: usize = 1232;
+
+const TX_BATCH_SIZE: usize = 10;
 
 // Send at ~100 TPS
 #[cfg(feature = "tpu")]
@@ -267,11 +264,6 @@ impl Jib {
         Ok(())
     }
 
-    /// Set the RPC URL to use for the transactions. This defaults to the public devnet URL.
-    // pub fn set_rpc_url(&mut self, url: &str) {
-    //     self.tpu_client = Self::create_tpu_client(url).unwrap();
-    // }
-
     /// Set the instructions to use for the transactions. This should be a vector of instructions that you wish to submit to the network.
     pub fn set_instructions(&mut self, ixes: Vec<Instruction>) {
         self.ixes = ixes;
@@ -307,6 +299,89 @@ impl Jib {
     /// Get the first signer that is being used by the Jib instance, the transaction fee payer.
     pub fn payer(&self) -> &Keypair {
         self.signers.first().unwrap()
+    }
+
+    pub async fn send(&mut self) -> Result<Vec<JibResult>, JibError> {
+        if self.ixes.is_empty() {
+            return Err(JibError::NoInstructions);
+        }
+
+        let mut packed_transactions = Vec::new();
+        let mut results = Vec::new();
+
+        let mut instructions = Vec::new();
+        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
+
+        if self.compute_budget != 200_000 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                self.compute_budget,
+            ));
+        }
+        if self.priority_fee != 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.priority_fee,
+            ));
+        }
+
+        let mut current_transaction =
+            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        let mut latest_blockhash = self
+            .client
+            .get_latest_blockhash()
+            .await
+            .map_err(|_| JibError::NoRecentBlockhash)?;
+
+        let mut ixes = self.ixes.clone();
+
+        for ix in ixes.iter_mut() {
+            instructions.push(ix.clone());
+            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+            tx.sign(&signers, latest_blockhash);
+
+            let tx_len = bincode::serialize(&tx).unwrap().len();
+
+            debug!("tx_len: {}", tx_len);
+
+            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
+                packed_transactions.push(current_transaction.clone());
+                debug!("Packed instructions: {}", instructions.len());
+
+                // Clear instructions except for the last one that pushed the transaction over the size limit.
+                // Check for compute budget and priority fees again and add them to the front of the instructions.
+                instructions = vec![];
+                if self.compute_budget != 200_000 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                        self.compute_budget,
+                    ));
+                }
+                if self.priority_fee != 0 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                        self.priority_fee,
+                    ));
+                }
+                instructions.push(ix.clone());
+            } else {
+                current_transaction = tx;
+            }
+
+            if packed_transactions.len() == TX_BATCH_SIZE {
+                results.extend(self._hoist(packed_transactions.clone()).await?);
+                packed_transactions.clear();
+
+                // Refresh blockhash.
+                latest_blockhash = self
+                    .client
+                    .get_latest_blockhash()
+                    .await
+                    .map_err(|_| JibError::NoRecentBlockhash)?;
+            }
+        }
+        packed_transactions.push(current_transaction);
+        results.extend(self._hoist(packed_transactions.clone()).await?);
+
+        Ok(results)
     }
 
     /// Pack the instructions into transactions. This will return a vector of transactions that can be submitted to the network.
@@ -379,6 +454,127 @@ impl Jib {
         Ok(packed_transactions)
     }
 
+    pub async fn retry_failed(
+        &mut self,
+        failed_transactions: Vec<JibFailedTransaction>,
+    ) -> Result<Vec<JibResult>, JibError> {
+        let mut status_tasks = FuturesOrdered::new();
+        let retries = Arc::new(Mutex::new(Vec::new()));
+
+        let ratelimiter = Ratelimiter::builder(self.rate_limit, Duration::from_secs(1))
+            .max_tokens(self.rate_limit)
+            .initial_available(self.rate_limit)
+            .build()
+            .unwrap();
+
+        let pb = ProgressBar::new(failed_transactions.len() as u64);
+        pb.set_message("Checking failed transaction statuses...");
+        for tx in failed_transactions {
+            // First we check the status of all the failed transactions to filter out any that have already been confirmed.
+            let pb = pb.clone();
+            let client = Arc::clone(&self.client);
+            let retries = Arc::clone(&retries);
+
+            // Wait for the ratelimiter to allow the transaction to be sent.
+            if let Err(sleep) = ratelimiter.try_wait() {
+                tokio::time::sleep(sleep).await;
+                continue;
+            }
+
+            let task = tokio::spawn(async move {
+                let res = client.confirm_transaction(&tx.signature).await;
+
+                // Retry any errors or unconfirmed transactions.
+                if res.is_err() || !res.unwrap() {
+                    let mut retries = retries.lock().await;
+                    retries.push(tx);
+                }
+            });
+            status_tasks.push_back(task);
+
+            pb.inc(1);
+        }
+        pb.finish();
+
+        while let Some(result) = status_tasks.next().await {
+            // We just need to wait for all the tasks to complete.
+            match result {
+                Ok(_) => {}
+                Err(e) => {
+                    // Log here? Tasks shouldn't panic.
+                    return Err(JibError::TransactionError(e.to_string()));
+                }
+            }
+        }
+
+        // Signers needs to be a vec of references to keypairs which can't be cloned. Might be better to just use a normal loop or par_iter
+        // to build all the transactions and then send them async without confirmation. Then we can check the statuses of all the transactions again.
+
+        let retries_vec = Arc::try_unwrap(retries).unwrap().into_inner();
+        let mut send_tasks = FuturesOrdered::new();
+
+        let ratelimiter = Ratelimiter::builder(self.rate_limit, Duration::from_secs(1))
+            .max_tokens(self.rate_limit)
+            .initial_available(self.rate_limit)
+            .build()
+            .unwrap();
+
+        println!("Found {} failed transactions to retry", retries_vec.len());
+
+        let pb = ProgressBar::new(retries_vec.len() as u64);
+        pb.set_message("Resending transactions...");
+        for tx in retries_vec.into_iter() {
+            let signers: Vec<Keypair> = self.signers.iter().map(clone_keypair).collect();
+            let pb = pb.clone();
+            let client = Arc::clone(&self.client);
+            // let retries = Arc::clone(&retries);
+
+            // Wait for the ratelimiter to allow the transaction to be sent.
+            if let Err(sleep) = ratelimiter.try_wait() {
+                tokio::time::sleep(sleep).await;
+                continue;
+            }
+
+            let task = tokio::spawn(async move {
+                let signers_ref: Vec<&Keypair> = signers.iter().collect();
+
+                let mut tx = Transaction::new_unsigned(tx.message.clone());
+                let blockhash = client
+                    .get_latest_blockhash()
+                    .await
+                    // .map_err(|_| JibError::NoRecentBlockhash);
+                    .unwrap();
+                tx.sign(&signers_ref, blockhash);
+
+                pb.inc(1);
+                let res = client.send_and_confirm_transaction(&tx.clone()).await;
+                match res {
+                    Ok(signature) => JibResult::Success(signature.to_string()),
+                    Err(e) => JibResult::Failure(JibFailedTransaction {
+                        signature: tx.signatures[0],
+                        message: tx.message.clone(),
+                        error: e.to_string(),
+                    }),
+                }
+            });
+            send_tasks.push_back(task);
+        }
+        pb.finish();
+
+        let mut results = Vec::new();
+
+        while let Some(result) = send_tasks.next().await {
+            match result {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    return Err(JibError::TransactionError(e.to_string()));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Used to repack failed transactions into new transactions with a fresh blockhash and signatures.
     /// These transacations can be resubmitted with `hoist_with_transactions`.
     pub async fn repack_failed(
@@ -442,7 +638,6 @@ impl Jib {
 
         println!("Found {} failed transactions to retry", retries.len());
 
-        // TODO: just repack and send right away so the blockhashes don't expire.
         let pb = ProgressBar::new(retries.len() as u64);
         pb.set_message("Repacking transactions...");
         for tx in retries.iter() {
@@ -481,7 +676,7 @@ impl Jib {
     }
 
     async fn _hoist(
-        &mut self,
+        &self,
         packed_transactions: Vec<Transaction>,
     ) -> Result<Vec<JibResult>, JibError> {
         let mut tasks = FuturesOrdered::new();
@@ -493,7 +688,7 @@ impl Jib {
             .unwrap();
 
         let pb = ProgressBar::new(packed_transactions.len() as u64);
-        pb.set_message("Sending transactions...");
+        pb.set_message("Sending batch of transactions...");
         for tx in packed_transactions {
             let pb = pb.clone();
             let client = Arc::clone(&self.client);
@@ -518,7 +713,6 @@ impl Jib {
             });
             tasks.push_back(task);
         }
-        pb.finish();
 
         let mut results = Vec::new();
 
@@ -530,6 +724,7 @@ impl Jib {
                 }
             }
         }
+        pb.finish_and_clear();
 
         Ok(results)
     }
@@ -700,6 +895,7 @@ impl Jib {
                                             ));
                                             jib_results.push(JibResult::Failure(
                                                 JibFailedTransaction {
+                                                    signature: *signature,
                                                     message: transactions[i].1.message.clone(),
                                                     error: status.err.clone().unwrap().to_string(),
                                                 },
@@ -763,4 +959,8 @@ fn set_message_for_confirmed_transactions(
             None => String::new(),
         },
     ));
+}
+
+fn clone_keypair(k: &Keypair) -> Keypair {
+    Keypair::from_bytes(&k.to_bytes()).unwrap()
 }
