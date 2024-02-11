@@ -1,23 +1,21 @@
 //! # Jib
 //!
 //! Jib is a simple Rust library that efficiently packs a vector of Solana instructions into maximum size and account length transactions
-//! and then uses the TPU client to send them directly to the current leader, rather than via a RPC node.
-//!
-//! It still uses a RPC client to determine the current leader, but it can be used with default public nodes as the single operation required
-//! does not need a high-throughput private RPC node.
+//! and then sends them over the network. It can be used with a RPC node to send the transactions async using Tokio green threads or with a TPU client
+//! which will send the transactions to the current leader and confirm them. It also has the ability to retry failed transactions and pack them into new transactions.
 //!
 //! ## Example Usage
 //!
 //! In this example we load a list of mint accounts we want to update the metadata for, and then we create a vector of instructions with the update_metadata_accounts_v2 instruction for each mint.
-//! We then pass this vector of instructions to Jib and it will pack them into the most efficient transactions possible and send them to the current leader.
+//! We then pass this vector of instructions to Jib and it will pack them into the most efficient transactions possible and send them to the network.
 //!
 //! ```ignore
 //! fn main() -> Result<()> {
 //!     // Load our keypair file.
 //!     let keypair = solana_sdk::signature::read_keypair_file("keypair.json").unwrap();
 //!
-//!     // Initialize Jib with our keypair and desired network. Devnet is also the default value: Network::default().
-//!     let mut jib = Jib::new(vec![keypair], Network::Devnet)?;
+//!     // Initialize Jib with our keypair and desired network.
+//!     let mut jib = Jib::new(vec![keypair], "https://frosty-forest-fields.solana-mainnet.quiknode.pro")?;
 //!
 //!     let mut instructions = vec![];
 //!
