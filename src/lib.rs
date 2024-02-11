@@ -301,159 +301,6 @@ impl Jib {
         self.signers.first().unwrap()
     }
 
-    pub async fn send(&mut self) -> Result<Vec<JibResult>, JibError> {
-        if self.ixes.is_empty() {
-            return Err(JibError::NoInstructions);
-        }
-
-        let mut packed_transactions = Vec::new();
-        let mut results = Vec::new();
-
-        let mut instructions = Vec::new();
-        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
-
-        if self.compute_budget != 200_000 {
-            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-                self.compute_budget,
-            ));
-        }
-        if self.priority_fee != 0 {
-            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
-                self.priority_fee,
-            ));
-        }
-
-        let mut current_transaction =
-            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
-        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
-
-        let mut latest_blockhash = self
-            .client
-            .get_latest_blockhash()
-            .await
-            .map_err(|_| JibError::NoRecentBlockhash)?;
-
-        let mut ixes = self.ixes.clone();
-
-        for ix in ixes.iter_mut() {
-            instructions.push(ix.clone());
-            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
-            tx.sign(&signers, latest_blockhash);
-
-            let tx_len = bincode::serialize(&tx).unwrap().len();
-
-            debug!("tx_len: {}", tx_len);
-
-            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
-                packed_transactions.push(current_transaction.clone());
-                debug!("Packed instructions: {}", instructions.len());
-
-                // Clear instructions except for the last one that pushed the transaction over the size limit.
-                // Check for compute budget and priority fees again and add them to the front of the instructions.
-                instructions = vec![];
-                if self.compute_budget != 200_000 {
-                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-                        self.compute_budget,
-                    ));
-                }
-                if self.priority_fee != 0 {
-                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
-                        self.priority_fee,
-                    ));
-                }
-                instructions.push(ix.clone());
-            } else {
-                current_transaction = tx;
-            }
-
-            if packed_transactions.len() == TX_BATCH_SIZE {
-                results.extend(self._hoist(packed_transactions.clone()).await?);
-                packed_transactions.clear();
-
-                // Refresh blockhash.
-                latest_blockhash = self
-                    .client
-                    .get_latest_blockhash()
-                    .await
-                    .map_err(|_| JibError::NoRecentBlockhash)?;
-            }
-        }
-        packed_transactions.push(current_transaction);
-        results.extend(self._hoist(packed_transactions.clone()).await?);
-
-        Ok(results)
-    }
-
-    /// Pack the instructions into transactions. This will return a vector of transactions that can be submitted to the network.
-    pub async fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
-        if self.ixes.is_empty() {
-            return Err(JibError::NoInstructions);
-        }
-
-        let mut packed_transactions = Vec::new();
-
-        let mut instructions = Vec::new();
-        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
-
-        if self.compute_budget != 200_000 {
-            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-                self.compute_budget,
-            ));
-        }
-        if self.priority_fee != 0 {
-            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
-                self.priority_fee,
-            ));
-        }
-
-        let mut current_transaction =
-            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
-        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
-
-        let latest_blockhash = self
-            .client
-            .get_latest_blockhash()
-            .await
-            .map_err(|_| JibError::NoRecentBlockhash)?;
-
-        for ix in self.ixes.iter_mut() {
-            instructions.push(ix.clone());
-            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
-            tx.sign(&signers, latest_blockhash);
-
-            let tx_len = bincode::serialize(&tx).unwrap().len();
-
-            debug!("tx_len: {}", tx_len);
-
-            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
-                packed_transactions.push(current_transaction.clone());
-                debug!("Packed instructions: {}", instructions.len());
-
-                // Clear instructions except for the last one that pushed the transaction over the size limit.
-                // Check for compute budget and priority fees again and add them to the front of the instructions.
-                instructions = vec![];
-                if self.compute_budget != 200_000 {
-                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-                        self.compute_budget,
-                    ));
-                }
-                if self.priority_fee != 0 {
-                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
-                        self.priority_fee,
-                    ));
-                }
-                instructions.push(ix.clone());
-            } else {
-                current_transaction = tx;
-            }
-        }
-        packed_transactions.push(current_transaction);
-
-        debug!("Packed transactions: {}", packed_transactions.len());
-
-        Ok(packed_transactions)
-    }
-
     pub async fn retry_failed(
         &mut self,
         failed_transactions: Vec<JibFailedTransaction>,
@@ -659,9 +506,84 @@ impl Jib {
 
     /// Pack the instructions and submit them to the network. This will return a vector of results.
     pub async fn hoist(&mut self) -> Result<Vec<JibResult>, JibError> {
-        let packed_transactions = self.pack().await?;
+        if self.ixes.is_empty() {
+            return Err(JibError::NoInstructions);
+        }
 
-        let results = self._hoist(packed_transactions).await?;
+        let mut packed_transactions = Vec::new();
+        let mut results = Vec::new();
+
+        let mut instructions = Vec::new();
+        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
+
+        if self.compute_budget != 200_000 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                self.compute_budget,
+            ));
+        }
+        if self.priority_fee != 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.priority_fee,
+            ));
+        }
+
+        let mut current_transaction =
+            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        let mut latest_blockhash = self
+            .client
+            .get_latest_blockhash()
+            .await
+            .map_err(|_| JibError::NoRecentBlockhash)?;
+
+        let mut ixes = self.ixes.clone();
+
+        for ix in ixes.iter_mut() {
+            instructions.push(ix.clone());
+            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+            tx.sign(&signers, latest_blockhash);
+
+            let tx_len = bincode::serialize(&tx).unwrap().len();
+
+            debug!("tx_len: {}", tx_len);
+
+            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
+                packed_transactions.push(current_transaction.clone());
+                debug!("Packed instructions: {}", instructions.len());
+
+                // Clear instructions except for the last one that pushed the transaction over the size limit.
+                // Check for compute budget and priority fees again and add them to the front of the instructions.
+                instructions = vec![];
+                if self.compute_budget != 200_000 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                        self.compute_budget,
+                    ));
+                }
+                if self.priority_fee != 0 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                        self.priority_fee,
+                    ));
+                }
+                instructions.push(ix.clone());
+            } else {
+                current_transaction = tx;
+            }
+
+            if packed_transactions.len() == TX_BATCH_SIZE {
+                results.extend(self._hoist(packed_transactions.clone()).await?);
+                packed_transactions.clear();
+
+                // Refresh blockhash.
+                latest_blockhash = self
+                    .client
+                    .get_latest_blockhash()
+                    .await
+                    .map_err(|_| JibError::NoRecentBlockhash)?;
+            }
+        }
+        packed_transactions.push(current_transaction);
+        results.extend(self._hoist(packed_transactions.clone()).await?);
 
         Ok(results)
     }
