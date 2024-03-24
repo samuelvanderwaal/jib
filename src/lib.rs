@@ -372,7 +372,6 @@ impl Jib {
             let signers: Vec<Keypair> = self.signers.iter().map(clone_keypair).collect();
             let pb = pb.clone();
             let client = Arc::clone(&self.client);
-            // let retries = Arc::clone(&retries);
 
             // Wait for the ratelimiter to allow the transaction to be sent.
             if let Err(sleep) = ratelimiter.try_wait() {
@@ -384,11 +383,7 @@ impl Jib {
                 let signers_ref: Vec<&Keypair> = signers.iter().collect();
 
                 let mut tx = Transaction::new_unsigned(tx.message.clone());
-                let blockhash = client
-                    .get_latest_blockhash()
-                    .await
-                    // .map_err(|_| JibError::NoRecentBlockhash);
-                    .unwrap();
+                let blockhash = client.get_latest_blockhash().await.unwrap();
                 tx.sign(&signers_ref, blockhash);
 
                 pb.inc(1);
