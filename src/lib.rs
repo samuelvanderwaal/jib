@@ -127,13 +127,13 @@ impl FromStr for Network {
     }
 }
 
-impl ToString for Network {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Network::Devnet => "devnet".to_string(),
-            Network::MainnetBeta => "mainnet".to_string(),
-            Network::Testnet => "testnet".to_string(),
-            Network::Localnet => "localnet".to_string(),
+            Network::Devnet => write!(f, "devnet"),
+            Network::MainnetBeta => write!(f, "mainnet"),
+            Network::Testnet => write!(f, "testnet"),
+            Network::Localnet => write!(f, "localnet"),
         }
     }
 }
@@ -236,6 +236,8 @@ impl Jib {
         ));
 
         Ok(Self {
+            #[cfg(feature = "tpu")]
+            tpu_client: None,
             client,
             signers,
             ixes: Vec::new(),
@@ -369,7 +371,7 @@ impl Jib {
         let pb = ProgressBar::new(retries_vec.len() as u64);
         pb.set_message("Resending transactions...");
         for tx in retries_vec.into_iter() {
-            let signers: Vec<Keypair> = self.signers.iter().map(clone_keypair).collect();
+            let signers: Vec<Keypair> = self.signers.iter().map(|k| k.insecure_clone()).collect();
             let pb = pb.clone();
             let client = Arc::clone(&self.client);
 
@@ -644,6 +646,72 @@ impl Jib {
         Ok(results)
     }
 
+    /// Pack the instructions into transactions without sending them.
+    pub async fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
+        if self.ixes.is_empty() {
+            return Err(JibError::NoInstructions);
+        }
+
+        let mut packed_transactions = Vec::new();
+
+        let mut instructions = Vec::new();
+        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
+
+        if self.compute_budget != 200_000 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                self.compute_budget,
+            ));
+        }
+        if self.priority_fee != 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.priority_fee,
+            ));
+        }
+
+        let mut current_transaction =
+            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        let latest_blockhash = self
+            .client
+            .get_latest_blockhash()
+            .await
+            .map_err(|_| JibError::NoRecentBlockhash)?;
+
+        for ix in self.ixes.iter_mut() {
+            instructions.push(ix.clone());
+            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+            tx.sign(&signers, latest_blockhash);
+
+            let tx_len = bincode::serialize(&tx).unwrap().len();
+
+            debug!("tx_len: {}", tx_len);
+
+            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
+                packed_transactions.push(current_transaction.clone());
+                debug!("Packed instructions: {}", instructions.len());
+
+                instructions = vec![];
+                if self.compute_budget != 200_000 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                        self.compute_budget,
+                    ));
+                }
+                if self.priority_fee != 0 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                        self.priority_fee,
+                    ));
+                }
+                instructions.push(ix.clone());
+            } else {
+                current_transaction = tx;
+            }
+        }
+        packed_transactions.push(current_transaction);
+
+        Ok(packed_transactions)
+    }
+
     /// Pack the instructions into transactions and submit them to the network via the TPU client.
     /// This will display a spinner while the transactions are being submitted.
     #[cfg(feature = "tpu")]
@@ -876,6 +944,269 @@ fn set_message_for_confirmed_transactions(
     ));
 }
 
-fn clone_keypair(k: &Keypair) -> Keypair {
-    Keypair::from_bytes(&k.to_bytes()).unwrap()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::signature::{Keypair, Signature};
+    use solana_sdk::signer::Signer;
+    use std::str::FromStr;
+
+    // ---- Network enum tests ----
+
+    #[test]
+    fn test_network_from_str_valid() {
+        assert_eq!(Network::from_str("devnet"), Ok(Network::Devnet));
+        assert_eq!(Network::from_str("mainnet"), Ok(Network::MainnetBeta));
+        assert_eq!(Network::from_str("testnet"), Ok(Network::Testnet));
+        assert_eq!(Network::from_str("localnet"), Ok(Network::Localnet));
+    }
+
+    #[test]
+    fn test_network_from_str_invalid() {
+        assert!(Network::from_str("invalid").is_err());
+        assert!(Network::from_str("Devnet").is_err());
+        assert!(Network::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_network_display_roundtrip() {
+        for variant in &[
+            Network::Devnet,
+            Network::MainnetBeta,
+            Network::Testnet,
+            Network::Localnet,
+        ] {
+            let display = variant.to_string();
+            let parsed = Network::from_str(&display).expect("round-trip should succeed");
+            assert_eq!(*variant, parsed);
+        }
+    }
+
+    #[test]
+    fn test_network_url() {
+        assert_eq!(Network::Devnet.url(), "https://api.devnet.solana.com");
+        assert_eq!(
+            Network::MainnetBeta.url(),
+            "https://api.mainnet-beta.solana.com"
+        );
+        assert_eq!(Network::Testnet.url(), "https://api.testnet.solana.com");
+        assert_eq!(Network::Localnet.url(), "http://127.0.0.1:8899");
+    }
+
+    #[test]
+    fn test_network_default_is_devnet() {
+        assert_eq!(Network::default(), Network::Devnet);
+    }
+
+    // ---- JibResult tests ----
+
+    fn make_success() -> JibResult {
+        JibResult::Success("somesig123".to_string())
+    }
+
+    fn make_failure() -> JibResult {
+        JibResult::Failure(JibFailedTransaction {
+            signature: Signature::default(),
+            message: Message::new(&[], None),
+            error: "something went wrong".to_string(),
+        })
+    }
+
+    #[test]
+    fn test_jib_result_is_success() {
+        assert!(make_success().is_success());
+        assert!(!make_failure().is_success());
+    }
+
+    #[test]
+    fn test_jib_result_is_failure() {
+        assert!(!make_success().is_failure());
+        assert!(make_failure().is_failure());
+    }
+
+    #[test]
+    fn test_jib_result_signature() {
+        assert_eq!(make_success().signature(), Some("somesig123".to_string()));
+        assert_eq!(make_failure().signature(), None);
+    }
+
+    #[test]
+    fn test_jib_result_error() {
+        assert_eq!(make_success().error(), None);
+        assert_eq!(
+            make_failure().error(),
+            Some("something went wrong".to_string())
+        );
+    }
+
+    #[test]
+    fn test_jib_result_message() {
+        assert!(make_success().message().is_none());
+        let msg = make_failure().message();
+        assert!(msg.is_some());
+    }
+
+    #[test]
+    fn test_jib_result_get_failure() {
+        assert!(make_success().get_failure().is_none());
+        let failed = make_failure().get_failure();
+        assert!(failed.is_some());
+        let failed = failed.unwrap();
+        assert_eq!(failed.error, "something went wrong");
+    }
+
+    // ---- Jib construction & setters tests ----
+
+    #[test]
+    fn test_jib_new_defaults() {
+        let kp = Keypair::new();
+        let pubkey = kp.pubkey();
+        let jib = Jib::new(vec![kp], "http://localhost:8899".to_string())
+            .expect("Jib::new should succeed");
+
+        assert_eq!(jib.compute_budget, 200_000);
+        assert_eq!(jib.priority_fee, 0);
+        assert_eq!(jib.batch_size, 10);
+        assert_eq!(jib.rate_limit, 10);
+        assert_eq!(jib.payer().pubkey(), pubkey);
+    }
+
+    #[test]
+    fn test_jib_payer_returns_first_signer() {
+        let kp1 = Keypair::new();
+        let kp2 = Keypair::new();
+        let expected = kp1.pubkey();
+        let jib = Jib::new(vec![kp1, kp2], "http://localhost:8899".to_string()).unwrap();
+        assert_eq!(jib.payer().pubkey(), expected);
+    }
+
+    #[test]
+    fn test_jib_set_compute_budget() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        jib.set_compute_budget(400_000);
+        assert_eq!(jib.compute_budget, 400_000);
+    }
+
+    #[test]
+    fn test_jib_set_priority_fee() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        jib.set_priority_fee(5000);
+        assert_eq!(jib.priority_fee, 5000);
+    }
+
+    #[test]
+    fn test_jib_set_batch_size() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        jib.set_batch_size(25);
+        assert_eq!(jib.batch_size, 25);
+    }
+
+    #[test]
+    fn test_jib_set_rate_limit() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        jib.set_rate_limit(50);
+        assert_eq!(jib.rate_limit, 50);
+    }
+
+    #[test]
+    fn test_jib_set_instructions() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        assert!(jib.ixes.is_empty());
+
+        let ix = Instruction::new_with_bytes(solana_sdk::system_program::id(), &[], vec![]);
+        jib.set_instructions(vec![ix.clone(), ix]);
+        assert_eq!(jib.ixes.len(), 2);
+    }
+
+    #[test]
+    fn test_jib_set_signers() {
+        let kp1 = Keypair::new();
+        let mut jib = Jib::new(vec![kp1], "http://localhost:8899".to_string()).unwrap();
+        assert_eq!(jib.signers.len(), 1);
+
+        let kp2 = Keypair::new();
+        let kp3 = Keypair::new();
+        jib.set_signers(vec![kp2, kp3]);
+        assert_eq!(jib.signers.len(), 2);
+    }
+
+    #[test]
+    fn test_jib_new_empty_signers() {
+        // new with empty signers succeeds (only fails at payer() time)
+        let jib = Jib::new(vec![], "http://localhost:8899".to_string());
+        assert!(jib.is_ok());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_jib_payer_panics_with_no_signers() {
+        let jib = Jib::new(vec![], "http://localhost:8899".to_string()).unwrap();
+        let _ = jib.payer(); // should panic because signers is empty
+    }
+
+    // ---- JibError display tests ----
+
+    #[test]
+    fn test_jib_error_display_no_instructions() {
+        let err = JibError::NoInstructions;
+        assert_eq!(err.to_string(), "No instructions to hoist");
+    }
+
+    #[test]
+    fn test_jib_error_display_no_recent_blockhash() {
+        let err = JibError::NoRecentBlockhash;
+        assert_eq!(err.to_string(), "No recent blockhash");
+    }
+
+    #[test]
+    fn test_jib_error_display_no_signers() {
+        let err = JibError::NoSigners;
+        assert_eq!(err.to_string(), "No signers found");
+    }
+
+    #[test]
+    fn test_jib_error_display_transaction_error() {
+        let err = JibError::TransactionError("timeout".to_string());
+        assert_eq!(err.to_string(), "Transaction Error");
+    }
+
+    #[test]
+    fn test_jib_error_display_batch_transaction_error() {
+        let err = JibError::BatchTransactionError("batch fail".to_string());
+        assert_eq!(err.to_string(), "Send batch transaction failed: batch fail");
+    }
+
+    #[test]
+    fn test_jib_error_display_failed_to_create_tpu_client() {
+        let err = JibError::FailedToCreateTpuClient("connection refused".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Failed to create the TPU client: connection refused"
+        );
+    }
+
+    // ---- Edge case: hoist/pack with no instructions ----
+
+    #[tokio::test]
+    async fn test_hoist_no_instructions_returns_error() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        let result = jib.hoist().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), JibError::NoInstructions));
+    }
+
+    #[tokio::test]
+    async fn test_pack_no_instructions_returns_error() {
+        let kp = Keypair::new();
+        let mut jib = Jib::new(vec![kp], "http://localhost:8899".to_string()).unwrap();
+        let result = jib.pack().await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), JibError::NoInstructions));
+    }
 }
