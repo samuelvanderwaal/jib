@@ -127,13 +127,13 @@ impl FromStr for Network {
     }
 }
 
-impl ToString for Network {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Network::Devnet => "devnet".to_string(),
-            Network::MainnetBeta => "mainnet".to_string(),
-            Network::Testnet => "testnet".to_string(),
-            Network::Localnet => "localnet".to_string(),
+            Network::Devnet => write!(f, "devnet"),
+            Network::MainnetBeta => write!(f, "mainnet"),
+            Network::Testnet => write!(f, "testnet"),
+            Network::Localnet => write!(f, "localnet"),
         }
     }
 }
@@ -236,6 +236,8 @@ impl Jib {
         ));
 
         Ok(Self {
+            #[cfg(feature = "tpu")]
+            tpu_client: None,
             client,
             signers,
             ixes: Vec::new(),
@@ -369,7 +371,7 @@ impl Jib {
         let pb = ProgressBar::new(retries_vec.len() as u64);
         pb.set_message("Resending transactions...");
         for tx in retries_vec.into_iter() {
-            let signers: Vec<Keypair> = self.signers.iter().map(clone_keypair).collect();
+            let signers: Vec<Keypair> = self.signers.iter().map(|k| k.insecure_clone()).collect();
             let pb = pb.clone();
             let client = Arc::clone(&self.client);
 
@@ -644,6 +646,72 @@ impl Jib {
         Ok(results)
     }
 
+    /// Pack the instructions into transactions without sending them.
+    pub async fn pack(&mut self) -> Result<Vec<Transaction>, JibError> {
+        if self.ixes.is_empty() {
+            return Err(JibError::NoInstructions);
+        }
+
+        let mut packed_transactions = Vec::new();
+
+        let mut instructions = Vec::new();
+        let payer_pubkey = self.signers.first().ok_or(JibError::NoSigners)?.pubkey();
+
+        if self.compute_budget != 200_000 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                self.compute_budget,
+            ));
+        }
+        if self.priority_fee != 0 {
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                self.priority_fee,
+            ));
+        }
+
+        let mut current_transaction =
+            Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+        let signers: Vec<&Keypair> = self.signers.iter().map(|k| k as &Keypair).collect();
+
+        let latest_blockhash = self
+            .client
+            .get_latest_blockhash()
+            .await
+            .map_err(|_| JibError::NoRecentBlockhash)?;
+
+        for ix in self.ixes.iter_mut() {
+            instructions.push(ix.clone());
+            let mut tx = Transaction::new_with_payer(&instructions, Some(&payer_pubkey));
+            tx.sign(&signers, latest_blockhash);
+
+            let tx_len = bincode::serialize(&tx).unwrap().len();
+
+            debug!("tx_len: {}", tx_len);
+
+            if tx_len > MAX_TX_LEN || tx.message.account_keys.len() > 64 {
+                packed_transactions.push(current_transaction.clone());
+                debug!("Packed instructions: {}", instructions.len());
+
+                instructions = vec![];
+                if self.compute_budget != 200_000 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+                        self.compute_budget,
+                    ));
+                }
+                if self.priority_fee != 0 {
+                    instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                        self.priority_fee,
+                    ));
+                }
+                instructions.push(ix.clone());
+            } else {
+                current_transaction = tx;
+            }
+        }
+        packed_transactions.push(current_transaction);
+
+        Ok(packed_transactions)
+    }
+
     /// Pack the instructions into transactions and submit them to the network via the TPU client.
     /// This will display a spinner while the transactions are being submitted.
     #[cfg(feature = "tpu")]
@@ -874,8 +942,4 @@ fn set_message_for_confirmed_transactions(
             None => String::new(),
         },
     ));
-}
-
-fn clone_keypair(k: &Keypair) -> Keypair {
-    Keypair::from_bytes(&k.to_bytes()).unwrap()
 }
