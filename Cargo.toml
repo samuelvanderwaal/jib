@@ -20,9 +20,9 @@ indicatif = "0.17"
 ratelimit = "0.9"
 rayon = "1"
 serde = "1"
-solana-client = "~2.2"
-solana-quic-client = { version = "~2.2", optional = true }
-solana-sdk = "~2.2"
+solana-client = "~2.3"
+solana-quic-client = { version = "~2.3", optional = true }
+solana-sdk = "~2.3"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
