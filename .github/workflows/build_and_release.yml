@@ -11,63 +11,34 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        os:
-          # - windows-latest
-          - buildjet-16vcpu-ubuntu-2004
-          # - macos-latest
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3.1.0
+        uses: actions/checkout@v4
 
-      - name: Install libudev-dev on Ubuntu
-        if: runner.os == 'Linux'
+      - name: Install libudev-dev
         run: |
           sudo apt-get update
-          sudo apt-get install libudev-dev
-      - name: Install Latest Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          default: true
-          override: true
+          sudo apt-get install -y libudev-dev
 
-      - name: Install rustfmt, clippy and cargo-cache
-        run: |
-          rustup component add rustfmt clippy
-          cargo install cargo-cache
+      - name: Install Latest Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Rustfmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy -- -D warnings
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+        run: cargo test
 
       - name: Build
-        id: build
-        shell: bash
-        run: |
-          cargo build --all --release
-
-      - name: Cleanup Dependencies
-        run: cargo cache clean-unref
+        run: cargo build --all --release
 
       - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
